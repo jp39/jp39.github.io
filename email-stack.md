@@ -549,16 +549,33 @@ already appear in the mailbox.
 
 I went through several other designs before ending up with the current model.
 
+### Outlook server-side rules
+
+The first version of this setup used Outlook's built-in server-side rules. That
+was probably the most natural place to start: the rules ran on the server, so
+mail was already filed by the time any client synchronized it.
+
+The problem was the interface. Editing filtering logic through Outlook's UI was
+awkward, opaque, and hard to review. I wanted rules I could keep in a text file,
+diff, edit in my normal editor, and version if needed. Outlook rules may be
+modifiable through APIs in some environments, but if that route exists for my
+account, access is almost certainly blocked by corporate policy. In practice,
+that left the UI as the only available editor, and I did not want my mail filing
+logic trapped there.
+
 ### Server-side imapfilter
 
-My original setup ran `imapfilter` against the Outlook 365 IMAP server before
-syncing locally. That had one big advantage: all filing happened remotely, so
-`mbsync` only had to mirror the result.
+The next iteration moved the rules out of Outlook's UI and into `imapfilter`,
+which ran against the Outlook 365 IMAP server before syncing locally. That had
+one big advantage: all filing still happened remotely, so `mbsync` only had to
+mirror the result.
 
 The downside was latency. Server-side IMAP searches and moves against a large
 corporate mailbox were slow, and every new-mail event could trigger a long
 remote filtering pass. It also made rule evaluation dependent on server
-behavior and network round trips.
+behavior and network round trips. There was also a language tradeoff:
+`imapfilter` uses Lua for rules, while this setup uses Sieve, a language
+designed specifically for writing email filters.
 
 Server-side filtering is conceptually clean, but for my mailbox it was too slow
 in practice.
@@ -643,21 +660,39 @@ extension coverage and fit. I specifically wanted standard-ish Sieve with
 and building a small Go command around it made deployment simple: one static-ish
 binary and no Python environment dependency for the filtering path.
 
-### Patching aerc
+### Patching aerc to coordinate new mail
 
-Another possible solution was to make aerc directly aware of the problem:
+One possible solution was to keep filtering external, but teach aerc about the
+handoff. The race I was trying to avoid was between two consumers of
+`INBOX/new/`: aerc can notice a new file and move it to `cur/`, while an
+external filtering tool may also want to process that same file as new mail.
 
-- block Maildir new-mail processing while `check-mail-cmd` runs;
-- add an aerc hook after messages move from `new/` to `cur/`;
-- integrate filtering directly into aerc;
-- submit the hook upstream.
+A small aerc patch could have made that handoff explicit. For example, aerc
+could block Maildir new-mail processing while `check-mail-cmd` runs, or expose
+a hook after it moves messages from `new/` to `cur/`. The filter would still be
+an external tool, but aerc would provide a cleaner synchronization point.
 
-That would solve the race close to the MUA, but it makes my mail stack depend
-on aerc changes. Carrying a local patch is annoying, and getting a new hook
-accepted upstream is a separate project.
+That approach is reasonable technically, but operationally it was not ideal for
+this setup. Carrying a local aerc patch is annoying, and getting a new hook or
+locking behavior accepted upstream is a separate project. I wanted the mail
+stack to work without depending on patched MUA behavior.
 
-The current design avoids that dependency. `aerc` remains a normal Maildir MUA.
-My automation watches the filesystem boundary that already exists.
+### Integrating filtering into aerc
+
+A more invasive version would be to make aerc perform the filtering itself.
+That would also eliminate the race, because aerc would be the single component
+that consumes `new/`, evaluates rules, and decides whether to keep or move the
+message.
+
+The downside is that filtering would become an aerc feature rather than a
+separate Maildir tool. That ties the rules and filing behavior to one MUA, and
+it is a much larger project than I needed here. I wanted aerc to remain a
+normal Maildir client, with synchronization and filtering handled by small
+external programs.
+
+The current design avoids both kinds of aerc dependency. `aerc` remains a
+normal Maildir MUA, and my automation watches the filesystem boundary that
+already exists.
 
 ### Blocking filesystem events externally
 
@@ -743,7 +778,8 @@ optimizing for. I wanted each component to have a narrow job:
 - `maildir-pushd` watches local changes and pushes them back;
 - `msmtpq` queues outbound mail;
 - `msmtp` sends through Office 365 SMTP;
-- the OAuth2 helper supplies XOAUTH2 tokens;
+- Mutt's `mutt_oauth2.py` helper supplies XOAUTH2 tokens for IMAP, IMAP IDLE,
+  and SMTP;
 - `maildir-rank-addr` builds a local address-completion cache.
 
 The main lesson, for me, is that Maildir's `new/` and `cur/` split is not
