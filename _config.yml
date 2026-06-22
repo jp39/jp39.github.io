@@ -1,0 +1,11 @@
+title: jp39 notes
+description: Notes about email, development workflows, and Unix tooling.
+url: "https://jp39.github.io"
+markdown: kramdown
+permalink: pretty
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
